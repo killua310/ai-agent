@@ -29,14 +29,14 @@ The core intelligence is powered by [LangGraph](https://langchain-ai.github.io/l
 
 ```mermaid
 graph LR
-    A[Input] --> B(Coreference Resolution)
-    B --> C(Entity Linking)
-    C --> D{Intent Classifier}
-    D -- Store --> E(Extraction & Storage)
-    E --> F(Generative Response)
-    D -- Query --> G(Retrieval & Reasoning)
-    D -- Chat --> H(General Chat)
-    F --> I[Output]
+    A["Input"] --> B["Coreference Resolution"]
+    B --> C["Entity Linking"]
+    C --> D{"Intent Classifier"}
+    D -- Store --> E["Extraction & Storage"]
+    E --> F["Generative Response"]
+    D -- Query --> G["Retrieval & Reasoning"]
+    D -- Chat --> H["General Chat"]
+    F --> I["Output"]
     G --> I
     H --> I
 ```
