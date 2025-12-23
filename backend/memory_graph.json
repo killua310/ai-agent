@@ -1,0 +1,135 @@
+{
+  "directed": true,
+  "multigraph": true,
+  "graph": {},
+  "nodes": [
+    {
+      "type": "person",
+      "attributes": {
+        "is": "pretty",
+        "is also": "figure skater",
+        "is working as": "coach"
+      },
+      "id": "Minji"
+    },
+    {
+      "type": "organization",
+      "id": "Korea University"
+    },
+    {
+      "type": "person",
+      "attributes": {
+        "is": "23 yrs old",
+        "figure skates": ""
+      },
+      "id": "Miccel"
+    },
+    {
+      "type": "person",
+      "attributes": {
+        "is": "over 60 kilos",
+        "is going on": "a diet"
+      },
+      "id": "mytzka"
+    },
+    {
+      "type": "organization",
+      "id": "LG"
+    },
+    {
+      "type": "location",
+      "id": "Magok"
+    },
+    {
+      "type": "person",
+      "attributes": {
+        "is": "57 years old"
+      },
+      "id": "Glenn"
+    },
+    {
+      "type": "person",
+      "id": "Minseok"
+    }
+  ],
+  "links": [
+    {
+      "relation": "is from",
+      "source": "Minji",
+      "target": "Korea University",
+      "key": 0
+    },
+    {
+      "relation": "does not work at",
+      "source": "Minji",
+      "target": "Korea University",
+      "key": 1
+    },
+    {
+      "relation": "studies at",
+      "source": "Minji",
+      "target": "Korea University",
+      "key": 2
+    },
+    {
+      "relation": "is brother of",
+      "source": "Minji",
+      "target": "Minseok",
+      "key": 0
+    },
+    {
+      "relation": "studies at",
+      "source": "Miccel",
+      "target": "Korea University",
+      "key": 0
+    },
+    {
+      "relation": "studies at",
+      "source": "Miccel",
+      "target": "Korea University",
+      "key": 1
+    },
+    {
+      "relation": "is friends with",
+      "source": "Miccel",
+      "target": "Minji",
+      "key": 0
+    },
+    {
+      "relation": "is brother of",
+      "source": "Miccel",
+      "target": "mytzka",
+      "key": 0
+    },
+    {
+      "relation": "is gonna work in",
+      "source": "Miccel",
+      "target": "LG",
+      "key": 0
+    },
+    {
+      "relation": "is sister of",
+      "source": "mytzka",
+      "target": "Miccel",
+      "key": 0
+    },
+    {
+      "relation": "is located at",
+      "source": "LG",
+      "target": "Magok",
+      "key": 0
+    },
+    {
+      "relation": "is mother of",
+      "source": "Glenn",
+      "target": "Miccel",
+      "key": 0
+    },
+    {
+      "relation": "is sibling of",
+      "source": "Minseok",
+      "target": "Minji",
+      "key": 0
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+from app.agent import SecondBrainAgent
+from langchain_core.messages import HumanMessage
+
+def test_crash():
+    agent_state = {"input": "miccel is a computer science student", "chat_history": []}
+    
+    # Mocking LLM/Agent is hard without full setup.
+    # Instead, let's try to run the server logic directly if possible, or just restart and check logs.
+    # But since I can't see the logs, I'll try to use the 'run_command' to start the server in blocking mode (shortly) or use 'read_terminal' on the OLDER process.
+    pass
+
+# Better idea: Read the log file if it exists, or the stdout of the process using command_status.
