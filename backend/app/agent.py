@@ -72,22 +72,23 @@ class SecondBrainAgent:
         
         # Paths
         self.workflow.add_node("store_memory", self.node_store_memory)
-        self.workflow.add_node("general_chat", self.node_general_chat) # Renamed from 'chat'
-        self.workflow.add_node("visualize_graph", self.node_visualize_graph) # New node
-        self.workflow.add_node("consolidate_memory", self.node_consolidate_memory) # New consolidation node
+        self.workflow.add_node("generate_storage_response", self.node_generate_storage_response)
+        self.workflow.add_node("general_chat", self.node_general_chat)
+        self.workflow.add_node("visualize_graph", self.node_visualize_graph)
+        self.workflow.add_node("consolidate_memory", self.node_consolidate_memory)
+        self.workflow.add_node("check_ambiguity", self.node_check_ambiguity)
         
         # Query Pipeline
-        # self.workflow.add_node("query_planner", self.node_query_planner) # Placeholder
         self.workflow.add_node("query_planner", self.node_query_planner)
         self.workflow.add_node("retrieval_node", self.node_retrieval)
         self.workflow.add_node("reasoning_node", self.node_reasoning)
-        self.workflow.add_node("answer_node", self.node_answer)
-        self.workflow.add_node("delete_memory", self.node_delete_memory) # Renamed from 'delete_node'
+        self.workflow.add_node("answer_node", self.node_answer) # Assuming this is the answer node logic
+        self.workflow.add_node("delete_memory", self.node_delete_memory)
 
         # -- ADD EDGES --
         self.workflow.set_entry_point("resolve_coref")
         self.workflow.add_edge("resolve_coref", "entity_linker")
-        self.workflow.add_edge("entity_linker", "classify_intent") # Connect to new classifier node name
+        self.workflow.add_edge("entity_linker", "classify_intent")
         
         def route_intent(state: AgentState):
             intent = state.get("intent", "chat")
@@ -104,18 +105,15 @@ class SecondBrainAgent:
             else:
                 return "general_chat"
 
-        self.workflow.add_node("check_ambiguity", self.node_check_ambiguity) # New ambiguity check node
-
         self.workflow.add_conditional_edges(
             "classify_intent",
             route_intent,
             {
                 "store_memory": "check_ambiguity", # Redirect store to check ambiguity first
-                "check_ambiguity": "check_ambiguity", # Explicit mapping
                 "delete_memory": "delete_memory",
                 "query_planner": "query_planner",
-                "general_chat": "general_chat",
-                "visualize_graph": "visualize_graph"
+                "visualize_graph": "visualize_graph",
+                "general_chat": "general_chat"
             }
         )
         
@@ -130,14 +128,17 @@ class SecondBrainAgent:
             "check_ambiguity",
             route_ambiguity,
             {
-               END: END,
-               "store_memory": "store_memory"
+                END: END,
+                "store_memory": "store_memory"
             }
         )
         
         # Connect Main Paths
-        self.workflow.add_edge("store_memory", "consolidate_memory") # Chain consolidation after storage
+        # Store -> Generate Response -> Consolidate -> End
+        self.workflow.add_edge("store_memory", "generate_storage_response")
+        self.workflow.add_edge("generate_storage_response", "consolidate_memory")
         self.workflow.add_edge("consolidate_memory", END)
+
         self.workflow.add_edge("delete_memory", END)
         self.workflow.add_edge("general_chat", END)
         self.workflow.add_edge("visualize_graph", END)
@@ -305,11 +306,12 @@ class SecondBrainAgent:
              "   - Replace pronouns with the concrete entity name.\n\n"
              "2) NODE TYPES (GRAPH CONNECTIVITY)\n"
              "   - PRIMARY NODES: 'person', 'organization'.\n"
-             "   - SECONDARY NODES: 'location', 'event', 'concept' -> Create these ONLY if they connect multiple people or are significant.\n"
-             "   - ATTRIBUTES: 'value', 'state', 'trait' -> Keep as attributes.\n\n"
+             "   - SECONDARY NODES: 'location', 'event', 'concept', 'hobby', 'occupation' -> Create these for nouns/activities (e.g. 'Figure Skating', 'Python', 'Korea').\n"
+             "     * CRITICAL: If multiple people share a hobby/job, it MUST be a Node to show the connection.\n"
+             "   - ATTRIBUTES: 'value', 'state', 'trait' -> Keep simple adjectives (e.g. 'happy', 'tall') or status as attributes.\n\n"
              "   Rules for classification:\n"
-             "   - IF entity is Person/Org/Location/Event -> type='relation' (Connects two Nodes).\n"
-             "   - IF entity is trait/preference/status -> type='attribute'.\n\n"
+             "   - IF entity is a Noun/Place/Event/Activity -> type='relation' (Node).\n"
+             "   - IF entity is just an Adjective/Property -> type='attribute'.\n\n"
              "3) UNIVERSAL ATTRIBUTE SCHEMA (TIERS)\n"
              "   Map extracted info to these keys if possible (for Person entities):\n"
              "   - TIER 1 (Identity): 'name', 'type', 'role' (e.g. friend, coworker), 'gender' (optional).\n"
@@ -338,7 +340,35 @@ class SecondBrainAgent:
         result = chain.invoke({"input": input_text, "history": history_text})
         
         triplets_added = []
+        
+        # Determine the "Self" identity dynamically
+        primary_user = self.memory.get_primary_user()
+        # If no primary user exists yet (fresh graph), fallback to "User" or extraction results
+        # However, we want to enforce consistency.
+        # If the user says "I am Miccel", extraction will yield (Miccel, type, Miccel).
+        # We only force-replace if we HAVE a primary user.
+        target_identity = primary_user if primary_user else "User"
+
         for t in result.triplets:
+            # 1. STRICT IDENTITY ENFORCEMENT
+            # If the extraction resulted in 'I', 'Me', 'My', or 'User', force it to the Primary Identity
+            if t.subject.lower() in ["i", "me", "my", "myself", "user"]:
+                # If we have a known primary user, force it.
+                # If we DON'T (target="User"), only force if the extracted name wasn't specific.
+                # Actually, simplest rule: "User" -> Primary. "I" -> Primary.
+                t.subject = target_identity
+                t.subject_type = "person"
+                
+            if t.object_.lower() in ["i", "me", "my", "myself", "user"]:
+                if t.object_type == "person":
+                     t.object_ = target_identity
+
+            # Special Case: If this is an identity declaration "User name is Miccel",
+            # we might have (User, name, Miccel).
+            # If we force subject="User", we get (User, name, Miccel).
+            # Ideally we want (Miccel, name, Miccel). 
+            # But the 'entity_linker' or 'coref' should handle "I am Miccel" -> "Miccel is Miccel".
+            
             # Update Node Types first
             self.memory.add_node_type(t.subject, t.subject_type)
             if t.type == "relation":
@@ -352,7 +382,32 @@ class SecondBrainAgent:
                 self.memory.add_relation(t.subject, t.predicate, t.object_, metadata=meta)
                 triplets_added.append(f"{t.subject} {t.predicate} {t.object_}")
             
-        return {"response": f"I stored that: {', '.join(triplets_added)}", "extracted_triplets": triplets_added}
+        return {"extracted_triplets": triplets_added}
+
+    def node_generate_storage_response(self, state: AgentState):
+        """Step (Response): Generate a natural, conversational response after storing memories."""
+        triplets = state.get("extracted_triplets", [])
+        if not triplets:
+            return {"response": "I didn't catch anything to remember there. Could you rephrase?"}
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a warm, thoughtful, and intelligent second brain assistant. "
+                       "You just stored the following new memories for the user.\n"
+                       "Stored Facts: {triplets}\n"
+                       "User Input: {input}\n\n"
+                       "YOUR GOAL: Generate a short, natural, human-like response.\n"
+                       "- ACKNOWLEDGE: Briefly confirm you understood, but DO NOT list the facts like a robot.\n"
+                       "- ENGAGE: If it's a life event (graduation, move, job), say congratulations or ask how it is.\n"
+                       "- CONNECT: If it's a preference (likes X), maybe ask a relevant follow-up.\n"
+                       "- PROACTIVE: If a NEW PERSON is met, ask about their role/relationship AND ask how you feel about them.\n"
+                       "- STATIC: If the user says 'nothing else' or just wants to store, simply say 'Got it' or 'Saved'.\n"
+                       "- TONE: Friendly, professional, curious. Use 1-2 sentences max."),
+            ("user", "Generate response.")
+        ])
+        
+        chain = prompt | self.llm
+        response = chain.invoke({"triplets": ", ".join(triplets), "input": state["input"]}).content
+        return {"response": response}
 
     def node_delete_memory(self, state: AgentState):
         """Handles deletion requests (Step 1: Ask Confirm, Step 2: Delete)."""
@@ -662,13 +717,19 @@ class SecondBrainAgent:
         seen = set()
 
         for s, p, o, meta in relations:
+            # Handle List Values (User manual edits or future features)
+            if isinstance(o, list):
+                o_str = ", ".join([str(i) for i in o])
+            else:
+                o_str = str(o)
+
             # Filter self-loops/redundant nodes (e.g. Miccel is Miccel)
-            if s.lower() == o.lower():
+            if s.lower() == o_str.lower():
                 continue
 
             # STRICT FILTER: Only include direct connections to the entity
             s_is_entity = (s.lower() == entity_lower)
-            o_is_entity = (o.lower() == entity_lower)
+            o_is_entity = (o_str.lower() == entity_lower)
             
             if not s_is_entity and not o_is_entity:
                 continue
@@ -682,9 +743,16 @@ class SecondBrainAgent:
                 # Check if specific relation exists for this pair (in EITHER direction)
                 has_specific = False
                 for s2, p2, o2, meta2 in relations:
+                    # Robust list handling for inner loop too
+                    o2_val = o2
+                    if isinstance(o2, list):
+                         o2_val = ", ".join([str(i) for i in o2])
+                    else:
+                         o2_val = str(o2)
+
                     # Check same direction matching s,o OR reverse direction matching o,s
-                    same_dir = (s2 == s and o2 == o)
-                    rev_dir = (s2 == o and o2 == s)
+                    same_dir = (s2 == s and o2_val == o_str)
+                    rev_dir = (s2 == o_str and o2_val == s)
                     
                     if (same_dir or rev_dir) and ("brother" in p2.lower() or "sister" in p2.lower()):
                         has_specific = True
@@ -693,20 +761,20 @@ class SecondBrainAgent:
                      continue # Skip generic sibling relation
             
             # Create a unique key to prevent duplicates
-            key = (s, p, o)
+            key = (s, p, o_str)
             if key in seen:
                 continue
             seen.add(key)
             
-            context_lines.append(f"{s} {p} {o}")
+            context_lines.append(f"{s} {p} {o_str}")
             
             # Grouping Logic
             # Direction handling: If s==entity, normal. If o==entity, incoming.
             
             label = p
-            value = o
+            value = o_str
             
-            if o.lower() == entity_lower:
+            if o_str.lower() == entity_lower:
                 # Incoming: "Miccel is friends with Mytzka" (Viewing Mytzka)
                 # Label: "is friends with (from)", Value: "Miccel"
                 # To keep it cleaner/simpler for now, we'll append "(from ...)" to the label or similar.

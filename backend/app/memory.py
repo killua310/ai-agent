@@ -50,6 +50,15 @@ class LocalMemoryStore:
                 
         return None
 
+    def get_primary_user(self):
+        """Returns the ID of the first 'person' node added to the graph."""
+        # Python 3.7+ preserves insertion order for dicts, so graph.nodes() order 
+        # roughly reflects creation order if loaded from JSON linearly.
+        for node, attrs in self.graph.nodes(data=True):
+            if attrs.get("type") == "person":
+                return node
+        return None
+
     def add_relation(self, subject: str, predicate: str, object_: str, metadata: Dict[str, Any] = None):
         """Adds a relationship to the graph: (Subject) -> [Predicate] -> (Object)"""
         if metadata is None:

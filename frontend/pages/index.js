@@ -50,7 +50,7 @@ export default function Home() {
       if (data && data.nodes.filter(n => n.type === 'person').length === 0) {
         setMessages([{ role: 'agent', content: "Hello! I am Synapse. I am here to help you remember important things and answer your questions. \n\n Tell me about yourself so we can get started!" }]);
       } else {
-        setMessages([{ role: 'agent', content: "Hello! I am Synapse. I am here to help you remember important things and answer your questions. Tell me something to remember or ask a question." }]);
+        setMessages([{ role: 'agent', content: "Welcome back! Tell me something to remember or ask a question." }]);
       }
     });
   }, []);
@@ -350,8 +350,8 @@ export default function Home() {
                 flexShrink: 0
               }}>
                 <GraphView
-                  height={250}
-                  width={460} // Approximate width of the panel (500px max - padding)
+                  height={275}
+                  // width prop removed to let it fill container
                   data={
                     filterMode ? {
                       // Multi-Entity Filter: INTERSECTION (Common Neighbors)
@@ -452,14 +452,10 @@ export default function Home() {
                         if (found) matchedNodes.push(found);
                       });
 
-                      if (matchedNodes.length > 1) {
-                        // Multi-mode
+                      if (matchedNodes.length > 0) {
+                        // Whether 1 or many, just FILTER visually. Do not open profile.
                         setSelectedEntity(null);
                         setFilterMode({ type: 'multi', ids: matchedNodes.map(n => n.id) });
-                      } else if (matchedNodes.length === 1) {
-                        // Single mode (shows details)
-                        handleNodeClick(matchedNodes[0]);
-                        setFilterMode(null);
                       } else {
                         console.log("No nodes found for:", val);
                       }
@@ -558,6 +554,7 @@ const styles = {
     maxWidth: '1200px',
     margin: '0 auto',
     width: '100%',
+    minHeight: 0, // Ensure main container respects 100vh
   },
   chatSection: {
     flex: 1,
@@ -570,6 +567,7 @@ const styles = {
     border: '1px solid #222',
     overflow: 'hidden',
     boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+    minHeight: 0, // Ensure chat section does not overflow parent
   },
   chatWindow: {
     flex: 1,
@@ -579,6 +577,7 @@ const styles = {
     flexDirection: 'column',
     gap: '15px',
     background: 'linear-gradient(180deg, rgba(20,20,20,0) 0%, rgba(20,20,20,0.5) 100%)',
+    minHeight: 0, // Ensure scrolling works
   },
   message: {
     padding: '12px 18px',
