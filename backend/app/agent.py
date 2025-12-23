@@ -7,15 +7,30 @@ from pydantic import BaseModel, Field
 from app.memory import LocalMemoryStore
 import json
 import os
+import datetime
 
-# Define the State
+# Define the Rational Agent State
 class AgentState(TypedDict):
-    input: str
-    intent: Literal["store", "query", "chat"]
+    input: str                  # Original user query
+    chat_history: List[str]     # Conversation context
+    
+    # -- PREPROCESSING --
+    rewritten_input: str        # After coref correction (e.g. "He" -> "Miccel")
+    entities: List[str]         # Canonical entity names mentioned
+    intent: Literal["store", "query", "chat"] 
+
+    # -- MEMORY & RETRIEVAL --
+    extracted_triplets: List[List[str]] # For storage path
+    context: List[str]          # Retrieved facts for query path
+    
+    # -- REASONING --
+    plan: List[str]             # Sub-queries or steps
+    context: List[str]          # Retrieved facts
+    visualize_targets: List[str] # Entities to visualize
+    reasoning_trace: Dict[str, Any] # {direct_facts: [], inferred_facts: []}
+    
+    # -- OUTPUT --
     response: str
-    extracted_triplets: List[List[str]] # [[Subject, Predicate, Object]]
-    context: str
-    chat_history: List[str]
 
 # Define Structured Output for Extraction
 class Triplet(BaseModel):
@@ -24,7 +39,7 @@ class Triplet(BaseModel):
     predicate: str = Field(description="The relationship type or attribute name")
     object_: str = Field(description="The object of the relationship or attribute value")
     object_type: Literal["person", "organization", "location", "object", "concept", "value"] = Field(description="Type of the object entity (use 'value' for attributes)")
-    type: Literal["relation", "attribute"] = Field(description="Type of information: 'relation' for node-to-node connection, 'attribute' for node property (e.g., adjectives)")
+    type: Literal["relation", "attribute"] = Field(description="Type of information: 'relation' for node-to-node connection, 'attribute' for node property")
 
 class ExtractionResult(BaseModel):
     triplets: List[Triplet] = Field(description="List of extracted knowledge triplets")
@@ -39,104 +54,288 @@ class SecondBrainAgent:
         
         if openai_key:
             print("Using OpenAI GPT Model (gpt-4o-mini)")
-            # gpt-4o-mini is the cheapest and most capable small model from OpenAI
             self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
         elif google_key:
             print("Using Google Gemini Model")
-            # Using latest stable flash alias
             self.llm = ChatGoogleGenerativeAI(model="gemini-flash-latest", temperature=0)
         else:
-             print("CRITICAL WARNING: No API Key found (OPENAI_API_KEY or GOOGLE_API_KEY). Agent will fail.")
-             # Dummy initialization to prevent crash before runtime
+             print("CRITICAL WARNING: No API Key found. Agent will fail.")
              self.llm = None
 
-        # Build the Graph
+        # Build the Rational Pipeline Graph
         self.workflow = StateGraph(AgentState)
         
-        # Add Nodes
-        self.workflow.add_node("classify", self.classify_input)
-        self.workflow.add_node("store_memory", self.store_memory)
-        self.workflow.add_node("answer_query", self.answer_query)
-        self.workflow.add_node("chat", self.general_chat)
-
-        # Add Edges
-        self.workflow.set_entry_point("classify")
+        # -- ADD NODES --
+        self.workflow.add_node("resolve_coref", self.node_resolve_coref)
+        self.workflow.add_node("entity_linker", self.node_entity_linker)
+        self.workflow.add_node("classify_intent", self.node_classify_intent)
         
+        # Paths
+        self.workflow.add_node("store_memory", self.node_store_memory)
+        self.workflow.add_node("general_chat", self.node_general_chat) # Renamed from 'chat'
+        self.workflow.add_node("visualize_graph", self.node_visualize_graph) # New node
+        self.workflow.add_node("consolidate_memory", self.node_consolidate_memory) # New consolidation node
+        
+        # Query Pipeline
+        # self.workflow.add_node("query_planner", self.node_query_planner) # Placeholder
+        self.workflow.add_node("query_planner", self.node_query_planner)
+        self.workflow.add_node("retrieval_node", self.node_retrieval)
+        self.workflow.add_node("reasoning_node", self.node_reasoning)
+        self.workflow.add_node("answer_node", self.node_answer)
+        self.workflow.add_node("delete_memory", self.node_delete_memory) # Renamed from 'delete_node'
+
+        # -- ADD EDGES --
+        self.workflow.set_entry_point("resolve_coref")
+        self.workflow.add_edge("resolve_coref", "entity_linker")
+        self.workflow.add_edge("entity_linker", "classify_intent") # Connect to new classifier node name
+        
+        def route_intent(state: AgentState):
+            intent = state.get("intent", "chat")
+            if intent == "store":
+                return "store_memory"
+            elif intent == "delete":
+                return "delete_memory"
+            elif intent == "confirmed_delete":
+                return "delete_memory"
+            elif intent == "query":
+                return "query_planner" 
+            elif intent == "visualize":
+                return "visualize_graph"
+            else:
+                return "general_chat"
+
+        self.workflow.add_node("check_ambiguity", self.node_check_ambiguity) # New ambiguity check node
+
         self.workflow.add_conditional_edges(
-            "classify",
-            lambda x: x["intent"],
+            "classify_intent",
+            route_intent,
             {
-                "store": "store_memory",
-                "query": "answer_query",
-                "chat": "chat"
+                "store_memory": "check_ambiguity", # Redirect store to check ambiguity first
+                "check_ambiguity": "check_ambiguity", # Explicit mapping
+                "delete_memory": "delete_memory",
+                "query_planner": "query_planner",
+                "general_chat": "general_chat",
+                "visualize_graph": "visualize_graph"
             }
         )
         
-        self.workflow.add_edge("store_memory", END)
-        self.workflow.add_edge("answer_query", END)
-        self.workflow.add_edge("chat", END)
+        # Ambiguity Check Routing
+        def route_ambiguity(state: AgentState):
+            # If the ambiguity node produced a response (question), stop and return it.
+            if state.get("response"):
+                return END
+            return "store_memory"
+
+        self.workflow.add_conditional_edges(
+            "check_ambiguity",
+            route_ambiguity,
+            {
+               END: END,
+               "store_memory": "store_memory"
+            }
+        )
+        
+        # Connect Main Paths
+        self.workflow.add_edge("store_memory", "consolidate_memory") # Chain consolidation after storage
+        self.workflow.add_edge("consolidate_memory", END)
+        self.workflow.add_edge("delete_memory", END)
+        self.workflow.add_edge("general_chat", END)
+        self.workflow.add_edge("visualize_graph", END)
+        
+        # Connect Query Path
+        self.workflow.add_edge("query_planner", "retrieval_node")
+        self.workflow.add_edge("retrieval_node", "reasoning_node")
+        self.workflow.add_edge("reasoning_node", "answer_node")
+        self.workflow.add_edge("answer_node", END)
+
 
         self.app = self.workflow.compile()
 
-    def classify_input(self, state: AgentState):
-        # Combine history for context
-        history_text = "\n".join(state.get("chat_history", [])[-3:]) # Last 3 Turns
+    # --- PREPROCESSING NODES ---
+    
+    def node_resolve_coref(self, state: AgentState):
+        """Step 1: Rewrite input to resolve pronouns using history."""
+        # Check if history exists
+        history_text = "\n".join(state.get("chat_history", [])[-5:]) # Last 5 turns
         
+        if not history_text:
+            return {"rewritten_input": state["input"]}
+
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a rational memory assistant. Classify the user input into one of these categories:\n"
-                       "- 'store': The user is telling you a fact to remember (e.g., 'Mom lives in New York', 'My name is John').\n"
-                       "- 'query': The user is asking a question OR Following up on a previous question (e.g., 'Where does mom live?', 'Where is that?', 'And my dad?').\n"
-                       "- 'chat': General greeting or non-memory interaction (e.g., 'Hello', 'How are you').\n"
-                       "Return ONLY the category name.\n\n"
-                       "Recent Chat History:\n{history}"),
+            ("system", "You are a Coreference Resolution system. Rewrite the user's latest query to resolve ALL pronouns (he, she, it, they) to specific names found in the Chat History.\n"
+                       "- USER IDENTITY: The user's name is 'Miccel'. ALWAYS resolve 'I', 'me', 'my' to 'Miccel'.\n"
+                       "- Input: 'Where does he work?' (History: 'Tell me about Miccel') -> Output: 'Where does Miccel work?'\n"
+                       "- Input: 'Is it cold there?' (History: 'I am in Magok') -> Output: 'Is it cold in Magok?'\n"
+                       "- ANSWERING CLARIFICATION: If the history shows the agent asked a question (e.g., 'Brother or friend?'), combine the user's answer with the original context.\n"
+                       "  - History: 'User: Beomgyu is my bro. Agent: Brother or friend?' Input: 'Friend' -> Output: 'Beomgyu is my friend.'\n"
+                       "- If no pronouns or no history context, return the input exactly as is.\n"
+                       "- RETURN ONLY THE REWRITTEN SENTENCE."),
+            ("user", "Chat History:\n{history}\n\nCurrent Input: {input}")
+        ])
+        chain = prompt | self.llm
+        rewritten = chain.invoke({"input": state["input"], "history": history_text}).content.strip()
+        print(f"[Coreference] Original: {state['input']} -> Rewritten: {rewritten}")
+        return {"rewritten_input": rewritten}
+
+    def node_entity_linker(self, state: AgentState):
+        """Step 2: Identify and link entities from the rewritten input."""
+        # Simple extraction for now, can be enhanced with fuzzy matching against graph nodes later
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Identify all key entities in the text. Return them as a COMMA-SEPARATED list.\n"
+                       "- Entities: People, Organizations, Locations, Objects.\n"
+                       "- Simplify: 'Miccel's mom' -> 'Miccel', 'Mom'.\n"
+                       "- Examples: 'Miccel works at LG' -> 'Miccel, LG'."),
             ("user", "{input}")
         ])
         chain = prompt | self.llm
-        response = chain.invoke({"input": state["input"], "history": history_text})
+        entities_str = chain.invoke({"input": state["rewritten_input"]}).content.strip()
+        
+        entities = [e.strip().replace("'", "").replace('"', "") for e in entities_str.split(',') if e.strip()]
+        
+        # Canonicalization (Basic) - e.g. "lg" -> "LG"
+        # In a real system, we would query the vector store/graph for closest match.
+        # For now, we trust the LLM or pass through.
+        
+        return {"entities": entities}
+
+    def node_classify_intent(self, state: AgentState):
+        # 1. Check for Confirmation Context (Stateless Check via History)
+        history = state.get("chat_history", [])
+        if history:
+            # Check last 2 messages in case current input was appended
+            last_msgs = history[-2:]
+            
+            print(f"[Classifier] Checking history for confirmation. Last msgs: {last_msgs}")
+
+            # Look for the specific confirmation string in RECENT history
+            confirm_request_found = False
+            target_phrase = "Are you sure you want to permanently delete"
+            
+            for msg in reversed(last_msgs):
+                # Handle LangChain Message Objects
+                if hasattr(msg, 'content'):
+                    content = msg.content
+                # Handle Strings (e.g. "AI: Are you sure...")
+                elif isinstance(msg, str):
+                    content = msg
+                else:
+                    content = str(msg)
+                
+                if target_phrase in content:
+                     confirm_request_found = True
+                     break
+            
+            if confirm_request_found:
+                 # Check if user says Yes (Relaxed check)
+                 cleaned_input = state["rewritten_input"].lower().strip(".! ")
+                 if cleaned_input in ["yes", "yes please", "confirm", "do it", "sure", "y", "yeah", "yep"]:
+                     print(f"[Classifier] Detected Confirmation for Deletion")
+                     return {"intent": "confirmed_delete"}
+                 else:
+                     print(f"[Classifier] Deletion cancelled (Input was '{cleaned_input}')")
+                     return {"intent": "chat"} # Treat as cancellation/chat
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a Semantic Intent Classifier. Classify the user's input into one of categories:\n"
+                       "- 'store': The user is providing new facts, memories, or updates to be saved.\n"
+                       "- 'query': The user is asking a question that involves specific ENTITIES (e.g. people, places, organizations) or personal memories. \n"
+                       "    - Even if it looks like a general question (e.g. 'Is Korea University good?'), if it involves a specific named entity, classify as 'query' so we can check for personal connections.\n"
+                       "- 'delete': The user explicitly wants to DELETE, REMOVE, or FORGET a specific entity or memory.\n"
+                       "    - Example: 'Delete Minseok', 'Forget about LG', 'Remove the node for Korea University'.\n"
+                       "- 'chat': The user is engaging in casual conversation, offering greetings, or asking purely abstract questions with NO specific entities.\n"
+                       "    - Example: 'Hi there', 'How are you?', 'What is love?'.\n\n"
+                       "Return ONLY one word: 'store', 'query', 'delete', or 'chat'."),
+            ("user", "Input: {input}")
+        ])
+        chain = prompt | self.llm
+        response = chain.invoke({"input": state["rewritten_input"]})
         intent = response.content.strip().lower()
         
-        # Fallback for safety
-        if intent not in ["store", "query", "chat"]:
+        if intent not in ["store", "query", "delete", "chat"]:
             intent = "chat"
             
+        print(f"[Classifier] Intent: {intent}")
         return {"intent": intent}
 
-    def store_memory(self, state: AgentState):
-        """Extracts entities and stores them in the graph."""
-        structured_llm = self.llm.with_structured_output(ExtractionResult)
+    def node_check_ambiguity(self, state: AgentState):
+        """Step (Ambiguity Check): Ask clarifying questions for ambiguous relationships."""
+        input_text = state["rewritten_input"]
         
-        # Combine history for context
-        history_text = "\n".join(state.get("chat_history", [])[-3:])
+        # Fast check for keywords that are often ambiguous
+        # We can also use LLM for this, but a keyword check + LLM confirm is robust.
+        # Let's use strict LLM to be safe and context-aware.
         
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Extract knowledge triples from the text.\n"
-                       "- RESOLVE PRONOUNS & LOCATIONS using context. Look at the last turn of history.\n"
-                       "  - 'She', 'He', 'It', 'They' MUST be replaced by the name of the person/object they refer to.\n"
-                       "  - Handle contractions: 'shes' -> 'She is' -> 'Minji is'. 'hes' -> 'He is'.\n"
-                       "- CLASSIFY TYPES: Detect the type of every entity (person, organization, location, object).\n"
-                       "- CONCEPTS AS ATTRIBUTES: Abstract concepts, states, or activities (e.g. 'on a diet', 'in love', 'sick') should be ATTRIBUTES, not separate nodes.\n"
-                       "- ATTRIBUTES: If the user describes a property (e.g., 'Minji is pretty'), classify as 'attribute'.\n"
-                       "  - Example: 'Minji is pretty' -> Subject='Minji', SubType='person', Predicate='is', Object='pretty', ObjType='value', Type='attribute'.\n"
-                       "  - Example: 'Mytzka is on a diet' -> Subject='Mytzka', SubType='person', Predicate='is on', Object='diet', ObjType='value', Type='attribute'.\n"
-                       "- RELATIONS: If the user connects two entities.\n"
-                       "  - Example: 'Minji goes to Korea University' -> Subject='Minji', SubType='person', Predicate='goes to', Object='Korea University', ObjType='organization', Type='relation'.\n"
-                       "- CONSISTENCY: Use canonical names.\n"
-                       "  - If 'Minji' exists, do not store 'Minji Kim' unless correcting.\n"
-                       "- NO REDUNDANCY: Do not store multiple similar relationships for the same pair.\n"
-                       "  - Example: If 'Miccel studies at Korea University', DO NOT also store 'Miccel is from Korea University'. Prefer the most specific one ('studies at').\n"
-                       "  - Example: If 'Mom is 50', do not store 'Mom age is 50'.\n"
-                       "- PERSON-CENTRIC: Prefer people as subjects.\n"
-                       "- CHAINED LOCATIONS: If 'Subject action Object at Location', store 'Subject action Object' AND 'Object is located at Location'.\n"
-                       "  - Example: 'I work at LG in Magok' -> 'I work at LG', 'LG is located at Magok'.\n"
-                       "- POSSESSIVE RELATIONSHIPS: 'X is Y's Z' should be 'X is Z of Y'.\n"
-                       "  - Example: 'Glenn is Miccel's mother' -> 'Glenn is mother of Miccel'.\n"
-                       "- RECIPROCAL INFERENCE: Deduce inverse relationships.\n"
-                       "  - If 'A is sister of B', store 'B is sibling of A' (or brother/sister if gender known).\n"
-                       "- SPECIFICITY: Do not store generic 'sibling' if 'brother' or 'sister' is known."),
+            ("system", "You are a Data Accuracy Guardian. Your job is to prevent ambiguous data from entering the Knowledge Graph.\n"
+                       "Analyze the input for specific ambiguous terms:\n"
+                       "- 'bro' -> Could be 'brother' (kinship) or 'close friend'.\n"
+                       "- 'partner' -> Could be 'spouse' or 'business partner'.\n"
+                       "- 'connected with' -> Too vague.\n"
+                       "- 'it', 'he', 'she' -> If the Coreference Resolution step failed to replace these with names, it's ambiguous.\n\n"
+                       "TASK:\n"
+                       "1. If the input contains such ambiguity that requires clarification, generate a polite question to ask the user.\n"
+                       "   - Example: Input 'He is my bro', Output: 'Just to clarify, do you mean he is your biological brother or a close friend?'\n"
+                       "2. If the input is clear (e.g., 'He is my brother', 'They are dating'), return 'CLEAR'.\n"
+                       "3. If it's just a general chat/greeting, return 'CLEAR'.\n\n"
+                       "RETURN ONLY the question or the word 'CLEAR'.v"),
+            ("user", "Input: {input}")
+        ])
+        
+        chain = prompt | self.llm
+        result = chain.invoke({"input": input_text}).content.strip()
+        
+        if result.upper() != "CLEAR":
+            return {"response": result} # Return question, stops flow
+            
+        return {} # Continue to store_memory
+
+    def node_store_memory(self, state: AgentState):
+        """Extracts entities and stores them in the graph using Rewritten Input."""
+        structured_llm = self.llm.with_structured_output(ExtractionResult)
+        
+        # Use rewritten input for better extraction
+        input_text = state["rewritten_input"]
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "INPUTS: (1) recent chat history, (2) current input.\n"
+             "OUTPUT: triplets matching the JSON schema. Follow these rules:\n"
+             "1) PRONOUN & LOCATION RESOLUTION\n"
+             "   - Use the last turn(s) of history to resolve 'I, me, my, she, he, they, it, there, here'.\n"
+             "   - Replace pronouns with the concrete entity name.\n\n"
+             "2) NODE TYPES (GRAPH CONNECTIVITY)\n"
+             "   - PRIMARY NODES: 'person', 'organization'.\n"
+             "   - SECONDARY NODES: 'location', 'event', 'concept' -> Create these ONLY if they connect multiple people or are significant.\n"
+             "   - ATTRIBUTES: 'value', 'state', 'trait' -> Keep as attributes.\n\n"
+             "   Rules for classification:\n"
+             "   - IF entity is Person/Org/Location/Event -> type='relation' (Connects two Nodes).\n"
+             "   - IF entity is trait/preference/status -> type='attribute'.\n\n"
+             "3) UNIVERSAL ATTRIBUTE SCHEMA (TIERS)\n"
+             "   Map extracted info to these keys if possible (for Person entities):\n"
+             "   - TIER 1 (Identity): 'name', 'type', 'role' (e.g. friend, coworker), 'gender' (optional).\n"
+             "   - TIER 2 (Facts): 'age', 'birthday', 'location' (city/region), 'occupation' (job title), 'education' (school/major).\n"
+             "   - TIER 3 (Social): 'is related to' (relationships), 'works at' (orgs). Note: These are usually RELATIONS (Nodes).\n"
+             "   - TIER 4 (Preferences): 'likes', 'dislikes', 'skills', 'weaknesses'.\n"
+             "   - TIER 5 (Personality): 'personality' (traits), 'habits'.\n"
+             "   - TIER 6 (History): 'life event' (moved, started job). Note: Usually RELATIONS.\n"
+             "   * Use these specific keys for attributes to keep the profile clean.\n"
+             "   * Example: 'Miccel likes coding' -> (Miccel, likes, coding, attribute).\n"
+             "   * Example: 'Miccel is a student' -> (Miccel, occupation, student, attribute).\n\n"
+             "4) CANONICAL NAMES & NO REDUNDANCY\n"
+             "   - Use canonical names (Minji, not Minji Kim).\n"
+             "   - No redundant triplets.\n\n"
+             "5) CHAINED LOCATIONS\n"
+             "   - If 'Subject action Object at Location':\n"
+             "       -> 'Subject action Object' (relation user->user/org) AND 'Object location is Location' (attribute).\n\n"
+             "6) SCOPE\n"
+             "   - Only use info in history/input. Return empty if none.\n"),
             ("user", "Chat History:\n{history}\n\nCurrent Input: {input}")
         ])
+        
+        # We pass history just in case, but coref is largely done. The Extraction prompt still helps for complex cases.
+        history_text = "\n".join(state.get("chat_history", [])[-5:])
         chain = prompt | structured_llm
-        result = chain.invoke({"input": state["input"], "history": history_text})
+        result = chain.invoke({"input": input_text, "history": history_text})
         
         triplets_added = []
         for t in result.triplets:
@@ -149,54 +348,191 @@ class SecondBrainAgent:
                 self.memory.add_attribute(t.subject, t.predicate, t.object_)
                 triplets_added.append(f"{t.subject} (attr: {t.predicate}) {t.object_}")
             else:
-                self.memory.add_relation(t.subject, t.predicate, t.object_)
+                meta = {"source": "user_input", "timestamp": datetime.datetime.now().isoformat()}
+                self.memory.add_relation(t.subject, t.predicate, t.object_, metadata=meta)
                 triplets_added.append(f"{t.subject} {t.predicate} {t.object_}")
             
         return {"response": f"I stored that: {', '.join(triplets_added)}", "extracted_triplets": triplets_added}
 
-    def answer_query(self, state: AgentState):
-        """Retrieves info and answers the question."""
-        # 1. Identify key entities in the query (Simple keyword extraction or LLM)
-        # For simplicity, let's just dump the graph context for now or search naive keywords
-        # A better approach: Ask LLM which entities to look up
+    def node_delete_memory(self, state: AgentState):
+        """Handles deletion requests (Step 1: Ask Confirm, Step 2: Delete)."""
+        intent = state.get("intent")
         
-        # Quick heuristic: All nodes for now (small graph) OR heuristic keyword match
-        # Let's do a simple full dump for context if small, otherwise keyword search
-        # Since this is a specialized agent, let's ask LLM "What entity is this about?"
-        
-        # 1. Identify key entities in the query
-        # 1. Identify key entities in the query
+        if intent == "confirmed_delete":
+            # Extract entity from LAST BOT MESSAGE
+            # "Are you sure you want to permanently delete Minseok from your memory?"
+            history = state.get("chat_history", [])
+            
+            # Find the confirmation message
+            target_msg = ""
+            for msg in reversed(history[-5:]):
+                content = msg.content if hasattr(msg, 'content') else str(msg)
+                if "Are you sure you want to permanently delete" in content:
+                    target_msg = content
+                    break
+            
+            # Simple parsing: assume format "delete [Entity] from"
+            import re
+            match = re.search(r"delete (.+?) from your memory", target_msg)
+            if match:
+                entity = match.group(1)
+                success = self.memory.remove_node(entity)
+                if success:
+                    return {"response": f"Deleted {entity} from memory."}
+                else:
+                    return {"response": f"Could not find {entity} to delete."}
+            else:
+                return {"response": "I lost track of what to delete. Please ask again."}
+
+        else: # Intent == 'delete'
+            # Identify what to delete from current input
+            entities = state.get("entities", [])
+            if not entities:
+                 return {"response": "I'm not sure what you want to delete. Please specify the name."}
+            
+            target = entities[0]
+            # Verify existence
+            if not self.memory._find_node(target):
+                 return {"response": f"I don't have any memory of {target}."}
+            
+            # Return confirmation prompt
+            return {"response": f"Are you sure you want to permanently delete {target} from your memory? This cannot be undone."}
+
+    def node_general_chat(self, state: AgentState):
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Identify all key entities to search for in this query. Return them as a COMMA-SEPARATED list.\n"
-                       "- If the user asks about themselves (e.g., 'Where do *I* live?', 'My name'), return 'I'.\n"
-                       "- If asking about a location (e.g., 'What is in the kitchen?'), return the location ('Kitchen').\n"
-                       "- Simplify to the core entities (e.g., 'mom's birthday' -> 'Mom').\n"
-                       "- Example: 'Difference between Miccel and Minji' -> 'Miccel, Minji'\n"
-                       "- RESOLVE PRONOUNS: If the query uses pronouns like 'he', 'she', 'they', or 'it', refer to the CHAT HISTORY to identify who is being discussed.\n"
-                       "- Example: History='Tell me about Miccel.', Query='Where does he work?' -> Return 'Miccel'."),
-            ("user", "Chat History:\n{history}\n\nCurrent Query: {input}")
+            ("system", "You are a friendly and helpful personal assistant. The user just said something that isn't a memory or a question. Respond warmly and encourage them to share a memory."),
+            ("user", "{input}")
         ])
         chain = prompt | self.llm
-        entities_str = chain.invoke({"input": state["input"], "history": state.get("history", [])}).content.strip()
+        response = chain.invoke({"input": state["rewritten_input"]})
+        return {"response": response.content}
+
+    def node_consolidate_memory(self, state: AgentState):
+        """Step (Consolidate): Merge and clean up semantic duplicates in memory."""
+        entities = state.get("entities", [])
+        if not entities:
+            print("[Consolidate] No entities to check.")
+            return {}
+
+        import json
+
+        triplets = []
+        raw_edges = [] 
+
+        # 1. Gather Ego Network for recent entities
+        for entity in entities:
+             rels = self.memory.query_relations(entity)
+             if rels:
+                 for s, p, o, meta in rels:
+                     # Flatten for LLM analysis
+                     # We need the key to delete it later. meta usually doesn't have key in query_relations output 
+                     # Wait, memory.py query_relations yields (s, p, o, meta). 
+                     # I need the 'key' to delete specific edges. 
+                     # I'll likely need to fetch edges directly or assume meta has it/I can find it.
+                     # Let's inspect memory.py query_relations again or just iterate edges.
+                     # It's safer to use the graph directly here since I'm the backend.
+                     pass 
+
+        # Direct Graph Access for Precision
+        candidates = []
         
-        # Parse entities
-        entities = [e.strip().replace("'", "").replace('"', "") for e in entities_str.split(',')]
+        for entity in entities:
+             node = self.memory._find_node(entity)
+             if not node: continue
+             
+             # Outgoing
+             if self.memory.graph.has_node(node):
+                 for neighbor in self.memory.graph.successors(node):
+                     edge_data = self.memory.graph.get_edge_data(node, neighbor)
+                     for key, attr in edge_data.items():
+                         candidates.append({
+                             "source": str(node),
+                             "target": str(neighbor),
+                             "predicate": attr.get('relation'),
+                             "key": key
+                         })
+                         
+             # Incoming (optional, but good for "is son of" vs "has son")
+             # Leaving incoming out for V1 to keep it simple, focus on "Same Subject Duplication"
         
+        if len(candidates) < 2:
+            return {}
+
+        # 2. Ask LLM to find duplicates
+        candidates_json = json.dumps(candidates, indent=2)
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a Knowledge Graph Curator. Your job is to identify SEMANTIC DUPLICATES in the list of connections.\n"
+                       "Rules for Duplication:\n"
+                       "1. Same Source + Same Target + Same Meaning Predicate = DUPLICATE.\n"
+                       "   - Example: 'is brother of' AND 'brother of' -> Keep one.\n"
+                       "   - Example: 'works at' AND 'is employed by' -> Keep one.\n"
+                       "2. Same Source + Same Target + TIMESTAMP update -> Do NOT delete if unique history is needed, but if it looks like a retry, merge.\n"
+                       "   - Generally, keep the shortest/cleanest predicate (e.g. 'works at' > 'is working as an employee at').\n\n"
+                       "OUTPUT:\n"
+                       "Return a JSON list of objects to DELETE. Structure: [{{'source': '...', 'target': '...', 'key': ...}}]\n"
+                       "Return ONLY JSON. If no duplicates, return empty list []."),
+            ("user", "Connections:\n{candidates_json}")
+        ])
+        
+        chain = prompt | self.llm
+        res = chain.invoke({"candidates_json": candidates_json})
+        
+        try:
+            content = res.content.replace('```json', '').replace('```', '').strip()
+            to_delete = json.loads(content)
+            
+            count = 0
+            for item in to_delete:
+                u = item.get("source")
+                v = item.get("target")
+                k = item.get("key")
+                
+                # Verify existence before deleting
+                if self.memory.graph.has_edge(u, v, key=k):
+                    self.memory.graph.remove_edge(u, v, key=k)
+                    count += 1
+            
+            if count > 0:
+                print(f"[Consolidate] Merged/Deleted {count} redundant edges.")
+                self.memory.save_graph()
+                
+        except Exception as e:
+            print(f"[Consolidate] Error parsing LLM response: {e}")
+            
+        return {}
+
+    def node_query_planner(self, state: AgentState):
+        """Step 0 (Query): Decompose complex queries."""
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a Query Planner. Break down the user's request into a simple step-by-step plan if it is complex. If it is a simple question, just return '1. Answer the question'.\n"
+                       "Return a newline-separated list of steps."),
+            ("user", "{input}")
+        ])
+        chain = prompt | self.llm
+        plan_text = chain.invoke({"input": state["rewritten_input"]}).content.strip()
+        plan = [line.strip() for line in plan_text.split('\n') if line.strip()]
+        print(f"[Planner] Plan: {plan}")
+        return {"plan": plan}
+
+    def node_retrieval(self, state: AgentState):
+        """Step 1 (Query): Retrieve context for entities + expansion."""
+        entities = state.get("entities", [])
         context_lines = []
+        
+        # 1. Initial Lookup
         for entity in entities:
              # Handle 'me' -> 'I' fallback
              if entity.lower() in ['me', 'my', 'myself']:
                  entity = 'I'
                  
-             # Get context for each entity
-             # We use depth=1 for multi-entity to avoid context explosion, or keep depth=2 if graph is small.
-             # Let's use standard logic.
-             
              relations = self.memory.query_relations(entity)
              search_results = self.memory.search_memory(entity)
              
              if relations:
-                 context_lines.extend([f"{s} {p} {o}" for s, p, o in relations])
+                 for s, p, o, meta in relations:
+                     ts = f" [Time: {meta.get('timestamp')}]" if meta.get('timestamp') else ""
+                     context_lines.append(f"{s} {p} {o}{ts}")
              if search_results:
                  context_lines.extend(search_results)
                  
@@ -204,9 +540,9 @@ class SecondBrainAgent:
         context_lines = list(set(context_lines))
             
         if context_lines:
-            initial_context = "\n".join(list(set(context_lines)))
+            initial_context = "\n".join(context_lines)
             
-            # 2. Graph Expansion: Check if we need to follow links
+            # 2. Graph Expansion Loop
             expansion_prompt = ChatPromptTemplate.from_messages([
                 ("system", "You are a research assistant. Based on the INITIAL CONTEXT and the USER QUERY, identify if we need to look up additional entities mentioned in the context to fully answer the question.\n"
                            "- Example: Query 'How do A and B know each other?' -> Context 'A works at Google', 'B works at Google'. -> No expansion needed (link found).\n"
@@ -215,39 +551,71 @@ class SecondBrainAgent:
                 ("user", "User Query: {input}\n\nInitial Context:\n{context}")
             ])
             expand_chain = expansion_prompt | self.llm
-            new_entities_str = expand_chain.invoke({"input": state["input"], "context": initial_context}).content.strip()
+            new_entities_str = expand_chain.invoke({"input": state["rewritten_input"], "context": initial_context}).content.strip()
             
             if "NONE" not in new_entities_str:
                 new_entities = [e.strip().replace("'", "").replace('"', "") for e in new_entities_str.split(',')]
                 for entity in new_entities:
-                     # Avoid re-searching known entities
-                     if entity in entities: 
-                         continue
+                     if entity in entities: continue # Avoid re-search
                      
                      relations = self.memory.query_relations(entity)
                      if relations:
-                         context_lines.extend([f"{s} {p} {o}" for s, p, o in relations])
-                     # We can skip search_memory for expansion to avoid noise, relations are usually what we want for traversing.
+                         for s, p, o, meta in relations:
+                             ts = f" [Time: {meta.get('timestamp')}]" if meta.get('timestamp') else ""
+                             context_lines.append(f"{s} {p} {o}{ts}")
 
-        # Deduplicate Final Context
-        final_context = "\n".join(list(set(context_lines))) if context_lines else "No direct information found."
+        final_context = list(set(context_lines))
+        print(f"[Retrieval] Found {len(final_context)} facts.")
+        return {"context": final_context}
 
-        # 3. Generate Answer with Deduction
+    def node_reasoning(self, state: AgentState):
+        """Step 2 (Query): Structured Reasoning."""
+        context_text = "\n".join(state.get("context", []))
+        if not context_text: 
+            return {"reasoning_trace": {"analysis": "No context found.", "conclusion": "Unknown"}}
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a Logical Reasoning Engine. Analyze the context to answer the query.\n"
+                       "1. List DIRECT FACTS currently in the user's memory (e.g. 'Minji is friend of Miccel').\n"
+                       "2. CHECK FOR INFERRED FACTS:\n"
+                       "   - ONLY infer relationships that are *logically* certain (e.g. A is brother of B -> B is sibling of A).\n"
+                       "   - DO NOT infer social relationships (e.g. Friends -> Sibling is FALSE).\n"
+                       "   - DO NOT hallucinate facts not present in the context. If A's sibling is not mentioned, say 'Unknown'.\n"
+                       "3. Identify CONTRADICTIONS if any (and resolve them based on recency if possible).\n"
+                       "4. Formulate a final logical ANSWER.\n"
+                       "Return a JSON object with keys: 'direct_facts', 'inferred_facts', 'contradictions', 'answer_logic'."),
+            ("user", "Query: {input}\n\nContext:\n{context}")
+        ])
+        # We generally want structured output here, but let's use a standard LLM call and parse JSON for simplicity/flexibility
+        chain = prompt | self.llm
+        response = chain.invoke({"input": state["rewritten_input"], "context": context_text})
+        
+        # Simple trace storage (ideally we parse JSON, but string is fine for V1 trace)
+        trace = {"raw_output": response.content}
+        print(f"[Reasoning] {response.content[:100]}...")
+        return {"reasoning_trace": trace}
+
+    def node_answer(self, state: AgentState):
+        """Step 3 (Query): Generate Final Response."""
+        context_text = "\n".join(state.get("context", []))
+        trace = state.get("reasoning_trace", {}).get("raw_output", "")
+        
         generation_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a proactive personal memory assistant. Answer the question using the provided Context.\n"
-                       "1. ANALYZE relationships. If A and B share a location (e.g. both study at KU), deduce they are likely schoolmates/colleagues.\n"
-                       "2. CHAIN facts. If 'Miccel works at LG' and 'LG is in Magok', answer 'Miccel works in Magok (at LG)'.\n"
-                       "3. If the context contains other *relevant* details (e.g., if asked about a person, briefly mention their location/job), mention them.\n"
-                       "4. STRICT RELEVANCE: If the user asks about a specific topic (e.g. 'work'), DISCARD context facts about unrelated topics (e.g. 'school', 'age', 'friends'). Only mention cross-domain facts if they directly answer the question.\n"
-                       "5. ENRICH answers with general world knowledge. If the context mentions a well-known entity (e.g. 'LG'), you MAY add a brief description (e.g. 'a major electronics conglomerate') if relevant.\n"
-                       "  - Note: Prioritize user Context, but use general knowledge to fill gaps or add flavor.\n"
-                       "If the context is empty, say 'I don't know that yet'."),
-            ("user", "Context:\n{context}\n\nQuestion: {input}")
+            ("system", "You are a proactive personal memory assistant. Answer the question using the Analysis provided.\n"
+                       "HYBRID SYNTHESIS STRATEGY:\n"
+                       "1. MAIN ANSWER (World Knowledge): If the question asks for an opinion, facts, or assessment (e.g. 'Is X good?'), answer primarily using your own general knowledge.\n"
+                       "2. PERSONAL CONTEXT (Memory): Check the provided context for any relevant connections.\n"
+                       "   - If found, mentions them as 'Verified Personal Connections'.\n"
+                       "   - Example: 'Yes, Korea University has a top-tier CS program... (World Knowledge). By the way, I recall that Minji studies there (Personal Memory).'\n"
+                       "3. DO NOT FORCE logic. Do not say 'It is good BECAUSE Minji goes there'. Say 'It is good... AND Minji goes there'.\n"
+                       "4. If the question is purely about personal memory (e.g. 'Where does Minji work?'), rely solely on context.\n"
+                       "Be warm and natural. If no info is found and it's not a general question, say 'I don't know that yet'."),
+            ("user", "User Query: {input}\n\nContext:\n{context}\n\nReasoning Analysis:\n{trace}")
         ])
         gen_chain = generation_prompt | self.llm
-        response = gen_chain.invoke({"context": final_context, "input": state["input"]})
+        response = gen_chain.invoke({"input": state["rewritten_input"], "context": context_text, "trace": trace})
         
-        return {"response": response.content, "context": final_context}
+        return {"response": response.content}
 
     def general_chat(self, state: AgentState):
         prompt = ChatPromptTemplate.from_messages([
@@ -257,6 +625,31 @@ class SecondBrainAgent:
         chain = prompt | self.llm
         response = chain.invoke({"input": state["input"]})
         return {"response": response.content}
+
+    def node_visualize_graph(self, state: AgentState):
+        """Extracts entities to visualize from the user input."""
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", 
+             "You are extracting entity names to visualize in a graph view.\n"
+             "INPUT: User request (e.g. 'Visualize Minji', 'Show network of Miccel and Glenn').\n"
+             "OUTPUT: A comma-separated list of strict entity names. If multiple, list them.\n"
+             "Example: 'Visualize Minji' -> 'Minji'\n"
+             "Example: 'Show me Miccel and LG' -> 'Miccel, LG'\n"),
+            ("user", "{input}")
+        ])
+        chain = prompt | self.llm
+        result = chain.invoke({"input": state["input"]})
+        
+        # Parse comma separated results
+        targets = [t.strip() for t in result.content.split(',') if t.strip()]
+        
+        # We also generate a confirmation response
+        if not targets:
+            response = "I couldn't identify who you want to visualize. "
+        else:
+            response = f"Visualizing network for: {', '.join(targets)}."
+            
+        return {"visualize_targets": targets, "response": response}
 
     def summarize_entity(self, entity: str) -> Dict[str, Any]:
         """Generates a profile summary for a given entity."""
@@ -268,7 +661,7 @@ class SecondBrainAgent:
         entity_lower = entity.lower()
         seen = set()
 
-        for s, p, o in relations:
+        for s, p, o, meta in relations:
             # Filter self-loops/redundant nodes (e.g. Miccel is Miccel)
             if s.lower() == o.lower():
                 continue
@@ -288,7 +681,7 @@ class SecondBrainAgent:
             if "sibling" in p.lower():
                 # Check if specific relation exists for this pair (in EITHER direction)
                 has_specific = False
-                for s2, p2, o2 in relations:
+                for s2, p2, o2, meta2 in relations:
                     # Check same direction matching s,o OR reverse direction matching o,s
                     same_dir = (s2 == s and o2 == o)
                     rev_dir = (s2 == o and o2 == s)
@@ -362,17 +755,31 @@ class SecondBrainAgent:
     def process_input(self, user_input: str, chat_history: List[str]):
         initial_state = {
             "input": user_input,
+            "chat_history": chat_history,
+            "rewritten_input": user_input,
+            "entities": [],
             "intent": "chat",
-            "response": "",
-            "extracted_triplets": [],
-            "context": "",
-            "chat_history": chat_history
+            "plan": [],
+            "context": [],
+            "visualize_targets": [],
+            "reasoning_trace": {"direct_facts": [], "inferred_facts": []},
+            "response": ""
         }
+        
         try:
+            # Run the graph
             result = self.app.invoke(initial_state)
-            return result["response"]
+            
+            # Extract visualization targets if present
+            visualize_targets = result.get("visualize_targets", [])
+            
+            return {
+                "response": result["response"],
+                "visualize_targets": visualize_targets
+            }
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
                 return "⚠️ **Rate Limit Reached**: My brain is tired (Gemini Free Tier Limit). Please wait 1 minute and try again."
             raise e
+

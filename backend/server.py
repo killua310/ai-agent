@@ -34,18 +34,26 @@ chat_history = []
 async def chat(request: ChatRequest):
     try:
         # Pass history to agent
-        response = agent.process_input(request.message, chat_history)
+        result = agent.process_input(request.message, chat_history)
+        
+        # Check if result is dict (new format) or str (legacy)
+        if isinstance(result, dict):
+            response_text = result["response"]
+            visualize_targets = result.get("visualize_targets", [])
+        else:
+            response_text = result
+            visualize_targets = []
         
         # Update history
         chat_history.append(f"User: {request.message}")
-        chat_history.append(f"AI: {response}")
+        chat_history.append(f"AI: {response_text}")
         
         # Keep last 10 turns
         if len(chat_history) > 20:
              chat_history.pop(0)
              chat_history.pop(0)
              
-        return {"response": response}
+        return {"response": response_text, "visualize_targets": visualize_targets}
     except Exception as e:
         import traceback
         traceback.print_exc()

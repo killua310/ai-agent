@@ -50,8 +50,11 @@ class LocalMemoryStore:
                 
         return None
 
-    def add_relation(self, subject: str, predicate: str, object_: str):
+    def add_relation(self, subject: str, predicate: str, object_: str, metadata: Dict[str, Any] = None):
         """Adds a relationship to the graph: (Subject) -> [Predicate] -> (Object)"""
+        if metadata is None:
+            metadata = {}
+            
         # Resolve to existing nodes if possible to avoid duplicates like "Mom" vs "mom"
         existing_subject = self._find_node(subject)
         existing_object = self._find_node(object_)
@@ -63,7 +66,6 @@ class LocalMemoryStore:
         # LOGIC FOR MOVING OBJECTS:
         # If predicate is location-based ('in', 'on', 'at', 'located in'), remove old location
         location_predicates = {'in', 'at', 'on', 'located in', 'is in', 'put ... in'} 
-        # Note: 'put ... in' is complex, but let's handle simple 'in/at' first or check substring
         
         # Simple heuristic: If predicate is strictly "in" or "is in", remove other "in" edges
         if predicate.lower() in ['in', 'is in', 'on', 'at']:
@@ -86,9 +88,28 @@ class LocalMemoryStore:
         self.graph.add_node(s_node)
         self.graph.add_node(o_node)
         
-        # Add edge with the predicate as an attribute. MultiDiGraph always adds a new edge.
-        self.graph.add_edge(s_node, o_node, relation=predicate)
-        print(f"[Memory] Stored: {s_node} -[{predicate}]-> {o_node}")
+        # Prepare edge attributes
+        edge_attrs = {'relation': predicate}
+        edge_attrs.update(metadata) # Merge metadata (timestamp, source, etc.)
+        
+        # Deduplication: Check if this exact relation exists
+        if self.graph.has_edge(s_node, o_node):
+             # iterate keys
+             edge_data = self.graph.get_edge_data(s_node, o_node)
+             for key, attr in edge_data.items():
+                 existing_rel = attr.get('relation', '')
+                 # Normalized comparison (ignore case and whitespace)
+                 if existing_rel.lower().strip() == predicate.lower().strip():
+                     # Update metadata only
+                     for k, v in metadata.items():
+                         self.graph[s_node][o_node][key][k] = v
+                     print(f"[Memory] Updated existing: {s_node} -[{predicate}]-> {o_node} | Meta updated")
+                     self.save_graph()
+                     return
+
+        # Add edge with the predicate and metadata
+        self.graph.add_edge(s_node, o_node, **edge_attrs)
+        print(f"[Memory] Stored: {s_node} -[{predicate}]-> {o_node} | Meta: {metadata}")
         
         # Auto-save on every update
         self.save_graph()
@@ -106,6 +127,23 @@ class LocalMemoryStore:
              self.graph.nodes[node]['type'] = type_
              print(f"[Memory] Set Type: {node} -> {type_}")
              self.save_graph()
+
+    def remove_node(self, entity: str):
+        """Soft Deletes a node: Removes attributes and OUTGOING edges, but keeps the node so incoming links remain."""
+        node = self._find_node(entity)
+        if node:
+            # 1. Clear Attributes (reset to empty)
+            self.graph.nodes[node].clear()
+            
+            # 2. Remove Outgoing Edges (What this entity knows)
+            # list() is needed to avoid iterator modification issues
+            for neighbor in list(self.graph.successors(node)):
+                self.graph.remove_edge(node, neighbor)
+                
+            print(f"[Memory] Soft deleted node: {node} (Preserved incoming links)")
+            self.save_graph()
+            return True
+        return False
 
     def add_attribute(self, entity: str, attribute: str, value: str):
         """Adds an attribute to a node (not a separate node). e.g. Minji -> is -> pretty"""
@@ -177,7 +215,7 @@ class LocalMemoryStore:
         # Deduplicate
         return list(set(results))
 
-    def query_relations(self, entity: str) -> List[Tuple[str, str, str]]:
+    def query_relations(self, entity: str) -> List[Tuple[str, str, str, Dict]]:
         """Finds all relationships connected to a specific entity"""
         results = []
         
@@ -195,7 +233,7 @@ class LocalMemoryStore:
             # 1. Get Node Attributes
             attrs = self.graph.nodes[target_node].get('attributes', {})
             for key, val in attrs.items():
-                results.append((target_node, key, val))
+                results.append((target_node, key, val, {})) # No meta for attributes yet
 
             # 2. Get Graph Relations (BFS)
             visited = set()
@@ -217,8 +255,9 @@ class LocalMemoryStore:
                     edge_data = self.graph.get_edge_data(current, neighbor)
                     # edge_data is a dict of keys -> attributes {0: {'relation': '...'}, 1: ...}
                     for key in edge_data:
-                        relation = edge_data[key].get('relation', 'related_to')
-                        results.append((current, relation, neighbor))
+                        attrs = edge_data.get(key, {})
+                        relation = attrs.get('relation', 'related_to')
+                        results.append((current, relation, neighbor, attrs))
                 
                 # Predecessors
                 for predecessor in self.graph.predecessors(current):
@@ -229,8 +268,9 @@ class LocalMemoryStore:
                     # Handle multiple edges
                     edge_data = self.graph.get_edge_data(predecessor, current)
                     for key in edge_data:
-                        relation = edge_data[key].get('relation', 'related_to')
-                        results.append((predecessor, relation, current))
+                        attrs = edge_data.get(key, {})
+                        relation = attrs.get('relation', 'related_to')
+                        results.append((predecessor, relation, current, attrs))
         return results
 
     def get_all_triplets(self) -> List[str]:
